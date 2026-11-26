@@ -1,0 +1,14 @@
+{
+  "name": "alertmanager2mattermost-poc",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Alertmanager webhook receiver for Mattermost: one post per alert group, edited in place from FIRING to RESOLVED.",
+  "license": "UNLICENSED",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node bridge.mjs",
+    "dry-run": "node bridge.mjs --dry-run",
+    "test": "node --test",
+    "test-alerts": "node send-test-alerts.mjs"
+  }
+}
