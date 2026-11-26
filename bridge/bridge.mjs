@@ -10,7 +10,7 @@
 // on first use of a channel the bridge reads its pinned posts and recent posts back. See README.md.
 import { createServer } from "node:http";
 import { pathToFileURL } from "node:url";
-import { mattermost } from "./mm-client.mjs";
+import { mattermost } from "../lib/mm-client.mjs";
 import { applyNotification, groupKeyOf, renderEvent, renderRoot, renderSummary, STATE_PROP, SUMMARY_PROP } from "./card.mjs";
 
 const bool = (v, dflt) => (v === undefined || v === "" ? dflt : !/^(0|false|no|off)$/i.test(v));

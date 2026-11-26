@@ -2,13 +2,17 @@
   "name": "alertmanager2mattermost-poc",
   "version": "0.1.0",
   "private": true,
-  "description": "Alertmanager webhook receiver for Mattermost: one post per alert group, edited in place from FIRING to RESOLVED.",
+  "description": "Mattermost PoCs before implementation: an Alertmanager bridge (one post per group, FIRING \u2192 RESOLVED in place) and the DevOps AI agent's Slack flow translated to Mattermost.",
   "license": "UNLICENSED",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
-    "start": "node bridge.mjs",
-    "dry-run": "node bridge.mjs --dry-run",
     "test": "node --test",
-    "test-alerts": "node send-test-alerts.mjs"
+    "start": "node bridge/bridge.mjs",
+    "dry-run": "node bridge/bridge.mjs --dry-run",
+    "test-alerts": "node bridge/send-test-alerts.mjs",
+    "demo": "node agent-flow/demo.mjs",
+    "callback": "node agent-flow/callback.mjs"
   }
 }
