@@ -28,7 +28,7 @@ const RESOLVED_COLOR = "#188038";
 const ACK_COLOR = "#9334e6";
 export const severityOf = (s) => SEVERITY[String(s ?? "").toLowerCase()] ?? UNKNOWN_SEVERITY;
 
-const KEEP_ANNOTATIONS = ["summary", "description", "message", "runbook_url", "runbook"];
+const KEEP_ANNOTATIONS = ["summary", "description", "message", "runbook_url", "runbook", "dashboard_url", "grafana_url", "dashboard"];
 /** Labels never worth a line: identity of the group, or noise that changes on every restart. */
 const NOT_A_SUBJECT = new Set(["alertname", "severity", "uid", "container_id", "image_id", "prometheus", "endpoint"]);
 const PREFERRED_SUBJECT = ["pod", "container", "node", "instance", "service", "deployment", "statefulset", "daemonset", "job_name", "persistentvolumeclaim", "job"];
@@ -240,14 +240,115 @@ function sourceUrl(url, prometheusUrl) {
 const byStart = (a, b) => Date.parse(a.startsAt) - Date.parse(b.startsAt);
 const byEndDesc = (a, b) => Date.parse(b.endsAt ?? 0) - Date.parse(a.endsAt ?? 0);
 
+/** The expression behind an alert, from Prometheus' generatorURL (`/graph?g0.expr=…`). */
+function exprOf(generatorURL) {
+  try {
+    return new URL(generatorURL).searchParams.get("g0.expr") || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
- * The group's post. `cfg`: { tz, now, alertmanagerUrl, prometheusUrl, actionUrl, secret, ackReaction,
- * mention, mentionSeverities, maxLines }. Text that must notify (the mention) stays in `message`.
+ * 📊 Grafana: the rule's own dashboard when it names one (annotation `dashboard_url`, `grafana_url` or
+ * `dashboard`); else, with GRAFANA_DATASOURCE_UID, Explore on the alert's own expression over the alert's
+ * time; else Grafana's alert list searched for the alert name. Nothing without GRAFANA_URL or an annotation.
+ */
+export function grafanaUrl(state, cfg = {}) {
+  const alerts = Object.values(state.alerts);
+  const base = (cfg.grafanaUrl ?? "").replace(/\/+$/, "");
+  for (const ann of [state.commonAnnotations ?? {}, ...alerts.map((a) => a.annotations ?? {})]) {
+    const own = ann.dashboard_url || ann.grafana_url || ann.dashboard;
+    if (own) return /^https?:\/\//.test(own) ? own : base ? `${base}/${own.replace(/^\/+/, "")}` : undefined;
+  }
+  if (!base) return undefined;
+  const expr = exprOf((alerts.find((a) => a.status === "firing") ?? alerts[0])?.generatorURL);
+  if (expr && cfg.grafanaDatasource) {
+    const start = Date.parse(alerts.map((a) => a.startsAt).sort()[0] ?? state.createdAt);
+    const to = state.status === "resolved" && state.resolvedAt ? String(Date.parse(state.resolvedAt) + 15 * 60_000) : "now";
+    const ds = { type: "prometheus", uid: cfg.grafanaDatasource };
+    const panes = { a: { datasource: cfg.grafanaDatasource, queries: [{ refId: "A", expr, datasource: ds }], range: { from: String(start - 30 * 60_000), to } } };
+    return `${base}/explore?schemaVersion=1&orgId=${cfg.grafanaOrgId ?? 1}&panes=${encodeURIComponent(JSON.stringify(panes))}`;
+  }
+  return `${base}/alerting/list?search=${encodeURIComponent(state.alertname)}`;
+}
+
+/**
+ * 📝 Jira: with JIRA_PROJECT_ID and JIRA_ISSUE_TYPE_ID, Jira's create form prefilled with the alert and a link
+ * back to this post (Server, Data Center and Cloud all take this URL); without them, a search for tickets
+ * that mention the alert. Nothing without JIRA_URL. Only a link: the bridge never calls Jira.
+ */
+export function jiraUrl(state, cfg = {}) {
+  const base = (cfg.jiraUrl ?? "").replace(/\/+$/, "");
+  if (!base) return undefined;
+  const alerts = Object.values(state.alerts);
+  if (!(cfg.jiraProjectId && cfg.jiraIssueTypeId)) {
+    return { label: "🔎 Jira", url: `${base}/issues/?jql=${encodeURIComponent(`text ~ "${state.alertname}" ORDER BY created DESC`)}` };
+  }
+  const tz = cfg.tz ?? "UTC";
+  const sevName = groupSeverity(state, alerts);
+  const ns = groupLabel(state, "namespace");
+  const cluster = groupLabel(state, "cluster");
+  const start = alerts.map((a) => a.startsAt).sort()[0] ?? state.createdAt;
+  const keys = subjectKeys(alerts, state.groupLabels);
+  const plain = (a) => keys.filter((k) => a.labels?.[k]).map((k) => `${k}=${a.labels[k]}`).join(" ") || "alert";
+  const ann = state.commonAnnotations ?? {};
+  const one = alerts[0]?.annotations ?? {};
+  const summary = `[${sevName}] ${state.alertname}${ns ? ` in ${ns}` : ""}${cluster ? ` (${cluster})` : ""}`;
+  const description = [
+    ann.summary ?? one.summary,
+    ann.description ?? one.description ?? one.message,
+    "",
+    `Started: ${new Date(start).toLocaleString("en-GB", { timeZone: tz })} ${tzLabel(tz)}`,
+    `Alerts (${alerts.length}):`,
+    ...alerts.slice(0, 20).map((a) => `- ${a.status === "firing" ? "FIRING" : "resolved"} ${plain(a)}`),
+    alerts.length > 20 ? `- +${alerts.length - 20} more` : undefined,
+    "",
+    cfg.permalink && `Mattermost: ${cfg.permalink}`,
+    grafanaUrl(state, cfg) && `Grafana: ${grafanaUrl(state, cfg)}`,
+  ].filter((l) => l !== undefined && l !== null && l !== false).join("\n").slice(0, 2000);
+  const q = new URLSearchParams({ pid: cfg.jiraProjectId, issuetype: cfg.jiraIssueTypeId, summary, description });
+  return { label: "📝 Jira", url: `${base}/secure/CreateIssueDetails!init.jspa?${q}` };
+}
+
+/** The shortcut line, in CARD_LINKS order; a link that cannot be built is left out. */
+function shortcuts(state, cfg, isFiring, firing, alerts, common, one) {
+  const out = [];
+  for (const name of cfg.cardLinks ?? ["grafana", "jira"]) {
+    if (name === "grafana") {
+      const u = grafanaUrl(state, cfg);
+      if (u) out.push(`[📊 Grafana](${u})`);
+    } else if (name === "jira") {
+      const j = jiraUrl(state, cfg);
+      if (j) out.push(`[${j.label}](${j.url})`);
+    } else if (name === "silence") {
+      const u = isFiring && silenceUrl(state, cfg.alertmanagerUrl || state.externalURL);
+      if (u) out.push(`[🔕 Silence](${u})`);
+    } else if (name === "source") {
+      const u = sourceUrl((firing[0] ?? alerts[0])?.generatorURL, cfg.prometheusUrl);
+      if (u) out.push(`[📈 Source](${u})`);
+    } else if (name === "runbook") {
+      const u = common.runbook_url ?? common.runbook ?? one.runbook_url ?? one.runbook;
+      if (u) out.push(`[📘 Runbook](${u})`);
+    }
+  }
+  return out.join(" · ");
+}
+
+const cell = (s) => String(s).replace(/\|/g, "\\|").replace(/\n+/g, " ");
+
+/**
+ * The group's post. `cfg`: { tz, now, cardStyle ("table" | "detailed"), cardLinks, grafanaUrl,
+ * grafanaDatasource, jiraUrl, jiraProjectId, jiraIssueTypeId, permalink, alertmanagerUrl, prometheusUrl,
+ * actionUrl, secret, ackReaction, mention, mentionSeverities, maxLines }. Text that must notify (the mention)
+ * stays in `message`.
  */
 export function renderRoot(state, cfg = {}) {
   const tz = cfg.tz ?? "UTC";
+  const tzName = tzLabel(tz);
   const now = cfg.now ?? new Date();
-  const maxLines = cfg.maxLines ?? 12;
+  const style = cfg.cardStyle === "detailed" ? "detailed" : "table";
+  const maxLines = cfg.maxLines ?? (style === "table" ? 15 : 12);
   const alerts = Object.values(state.alerts);
   const firing = alerts.filter((a) => a.status === "firing").sort(byStart);
   const resolved = alerts.filter((a) => a.status === "resolved").sort(byEndDesc);
@@ -257,55 +358,77 @@ export function renderRoot(state, cfg = {}) {
   const ns = groupLabel(state, "namespace");
   const cluster = groupLabel(state, "cluster");
   const start = alerts.map((a) => a.startsAt).sort()[0] ?? state.createdAt;
+  const after = (from, to) => span(Date.parse(to) - Date.parse(from));
 
   const counts = alerts.length > 1 ? (isFiring ? `${firing.length} of ${alerts.length} firing` : `${alerts.length} alerts`) : "";
   const head = isFiring ? "🔥 **FIRING**" : "✅ **RESOLVED**";
   const mention = isFiring && cfg.mention && (cfg.mentionSeverities ?? ["critical"]).includes(String(sevName).toLowerCase()) ? `\n${cfg.mention}` : "";
-  const message = [head, `**${state.alertname}**`, `${sev.emoji} ${sevName}`, ns && `\`${ns}\``, counts].filter(Boolean).join(" · ") + mention;
+  // the table style names the namespace on its own meta line, so the message stays one short status line
+  const message = [head, `**${state.alertname}**`, `${sev.emoji} ${sevName}`, style === "detailed" && ns && `\`${ns}\``, counts].filter(Boolean).join(" · ") + mention;
 
   // Summary and description: the group's own when its alerts agree, else one alert's, labelled as such.
   const common = state.commonAnnotations ?? {};
   const one = firing[0]?.annotations ?? alerts[0]?.annotations ?? {};
   const speaks = (k) => (common[k] ? common[k] : alerts.length === 1 ? one[k] : one[k] ? `${one[k]} _(1 of ${alerts.length})_` : undefined);
+  const summary = speaks("summary");
+  const description = speaks("description") ?? speaks("message");
+  const keys = subjectKeys(alerts, state.groupLabels);
+
   const lines = [];
   if (state.previous) {
     lines.push(`🔁 Fired again — the last one resolved ${span(now - Date.parse(state.previous.resolvedAt))} before this ([previous](${state.previous.permalink})).`);
   }
   if (state.orphan) lines.push("_The firing post for this group was not found (sent before the bridge ran, or to another channel)._");
-  const summary = speaks("summary");
-  const description = speaks("description") ?? speaks("message");
-  if (summary) lines.push(`**Summary:** ${summary}`);
-  if (description && description !== summary) lines.push(`**Description:** ${description}`);
 
-  const keys = subjectKeys(alerts, state.groupLabels);
-  if (alerts.length > 1 || keys.length) {
-    const rows = [
-      ...firing.map((a) => `🔥 ${subjectOf(a, keys)} · since ${clock(a.startsAt, tz, now)}`),
-      ...resolved.map((a) => `✅ ${subjectOf(a, keys)} · resolved ${clock(a.endsAt, tz, now)} after ${span(Date.parse(a.endsAt) - Date.parse(a.startsAt))}`),
-    ];
-    if (lines.length) lines.push("");
-    lines.push(...rows.slice(0, maxLines));
-    const more = rows.length - maxLines + (state.dropped ?? 0);
-    if (more > 0) lines.push(`_+${more} more_`);
+  let fields = [];
+  if (style === "table") {
+    const about = [summary, description && description !== summary ? description : undefined].filter(Boolean).join(" ");
+    if (about) lines.push(about);
+    lines.push(
+      [
+        ns && `\`${ns}\``,
+        cluster,
+        `started ${clock(start, tz, now)} ${tzName}`,
+        !isFiring && `resolved ${clock(state.resolvedAt, tz, now)} · after ${after(start, state.resolvedAt)}`,
+        state.ack && `👀 @${state.ack.by} · ${clock(state.ack.at, tz, now)}`,
+      ].filter(Boolean).join(" · ")
+    );
+    if (keys.length) {
+      const title = (k) => k.charAt(0).toUpperCase() + k.slice(1).replace(/_/g, " ");
+      const rows = [
+        ...firing.map((a) => ["🔥", ...keys.map((k) => (a.labels?.[k] ? `\`${cell(a.labels[k])}\`` : "—")), clock(a.startsAt, tz, now), "firing"]),
+        ...resolved.map((a) => ["✅", ...keys.map((k) => (a.labels?.[k] ? `\`${cell(a.labels[k])}\`` : "—")), clock(a.startsAt, tz, now), `${clock(a.endsAt, tz, now)} · ${after(a.startsAt, a.endsAt)}`]),
+      ];
+      const cols = ["", ...keys.map(title), "Since", "Resolved"];
+      lines.push("", `| ${cols.join(" | ")} |`, `|${cols.map(() => "---").join("|")}|`, ...rows.slice(0, maxLines).map((r) => `| ${r.join(" | ")} |`));
+      const more = rows.length - maxLines + (state.dropped ?? 0);
+      if (more > 0) lines.push("", `_+${more} more_`);
+    }
+  } else {
+    if (summary) lines.push(`**Summary:** ${summary}`);
+    if (description && description !== summary) lines.push(`**Description:** ${description}`);
+    if (alerts.length > 1 || keys.length) {
+      const rows = [
+        ...firing.map((a) => `🔥 ${subjectOf(a, keys)} · since ${clock(a.startsAt, tz, now)}`),
+        ...resolved.map((a) => `✅ ${subjectOf(a, keys)} · resolved ${clock(a.endsAt, tz, now)} after ${after(a.startsAt, a.endsAt)}`),
+      ];
+      if (lines.length) lines.push("");
+      lines.push(...rows.slice(0, maxLines));
+      const more = rows.length - maxLines + (state.dropped ?? 0);
+      if (more > 0) lines.push(`_+${more} more_`);
+    }
+    fields = [
+      ns && { short: true, title: "Namespace", value: `\`${ns}\`` },
+      cluster && { short: true, title: "Cluster", value: cluster },
+      { short: true, title: "Started", value: `${clock(start, tz, now)} ${tzName}` },
+      !isFiring && { short: true, title: "Resolved", value: `${clock(state.resolvedAt, tz, now)} ${tzName} · after ${after(start, state.resolvedAt)}` },
+      state.ack && { short: true, title: "Acknowledged", value: `@${state.ack.by} · ${clock(state.ack.at, tz, now)}` },
+    ].filter(Boolean);
   }
 
-  const runbook = common.runbook_url ?? common.runbook ?? one.runbook_url ?? one.runbook;
-  const links = [
-    isFiring && silenceUrl(state, cfg.alertmanagerUrl || state.externalURL) && `[🔕 Silence](${silenceUrl(state, cfg.alertmanagerUrl || state.externalURL)})`,
-    sourceUrl((firing[0] ?? alerts[0])?.generatorURL, cfg.prometheusUrl) && `[📈 Source](${sourceUrl((firing[0] ?? alerts[0]).generatorURL, cfg.prometheusUrl)})`,
-    runbook && `[📘 Runbook](${runbook})`,
-  ].filter(Boolean);
-  if (links.length) lines.push("", links.join(" · "));
+  const links = shortcuts(state, cfg, isFiring, firing, alerts, common, one);
+  if (links) lines.push("", links);
   if (isFiring && !state.ack && cfg.ackReaction) lines.push("", `_To acknowledge, click the :${cfg.ackReaction}: reaction under this post._`);
-
-  const tzName = tzLabel(tz);
-  const fields = [
-    ns && { short: true, title: "Namespace", value: `\`${ns}\`` },
-    cluster && { short: true, title: "Cluster", value: cluster },
-    { short: true, title: "Started", value: `${clock(start, tz, now)} ${tzName}` },
-    !isFiring && { short: true, title: "Resolved", value: `${clock(state.resolvedAt, tz, now)} ${tzName} · after ${span(Date.parse(state.resolvedAt) - Date.parse(start))}` },
-    state.ack && { short: true, title: "Acknowledged", value: `@${state.ack.by} · ${clock(state.ack.at, tz, now)}` },
-  ].filter(Boolean);
 
   const color = !isFiring ? RESOLVED_COLOR : state.ack ? ACK_COLOR : sev.color;
   const title = `${isFiring ? (state.ack ? "👀 FIRING · ACKNOWLEDGED" : "🔥 FIRING") : "✅ RESOLVED"} — ${state.alertname}`;
@@ -318,7 +441,7 @@ export function renderRoot(state, cfg = {}) {
     color,
     title,
     text: lines.join("\n"),
-    fields,
+    ...(fields.length ? { fields } : {}),
     footer: `${state.receiver || "alertmanager"} · updated ${clock(state.updatedAt, tz, now)} ${tzName}`,
     ...(actions.length ? { actions } : {}),
   };

@@ -8,7 +8,7 @@ What keeps an alert from sinking or being missed:
 
 | | |
 |---|---|
-| **One post per group, edited in place** | FIRING → RESOLVED on the same post (colour, title, fields, the alert list). No second "resolved" post to match up by eye. |
+| **One post per group, edited in place** | FIRING → RESOLVED on the same post (colour, title, the table of alerts). No second "resolved" post to match up by eye. |
 | **Pinned while firing** | The channel's *Pinned messages* list is exactly what is still firing; a resolve unpins it. |
 | **🔥 / ✅ reaction** | Visible in the channel view without opening anything. |
 | **The thread is the timeline** | "1 more firing", "1 resolved · 2 still firing", "⏰ Still firing · 4h · not acknowledged", "✅ All resolved after 38m". |
@@ -52,8 +52,15 @@ Start the bridge with `REMIND_MINUTES=0` to see the "still firing" reminder at s
 | `ACK_REACTION` | `eyes` | The emoji that acknowledges (👀). `off` = no acknowledge by reaction. |
 | `ACK_POLL_SECONDS` | `30` | How often the reactions of the unacknowledged firing posts are read — one bulk request (`POST /posts/ids/reactions`) per round, none while nothing is open. |
 | `BRIDGE_URL` | — | Optional, and the ONE inbound path: the bridge's URL **as the Mattermost server reaches it** (e.g. `http://10.0.0.5:8080`). Set = an Acknowledge button as well. |
-| `ALERTMANAGER_URL` | payload `externalURL` | User-facing Alertmanager URL for the 🔕 Silence link. |
-| `PROMETHEUS_URL` | — | Rewrites the origin of `generatorURL` (📈 Source), which is usually Prometheus' in-cluster hostname. |
+| `CARD_STYLE` | `table` | `table`: one status line, a meta line (namespace · cluster · started · acknowledged · resolved) and a table with a row per alert. `detailed`: the first layout, with fields and a line per alert. |
+| `CARD_LINKS` | `grafana,jira` | The shortcuts under the card, in this order. Also available: `silence`, `source`, `runbook`. A link that cannot be built is left out. |
+| `GRAFANA_URL` | — | Grafana's base URL. Needed for 📊 Grafana unless a rule's `dashboard_url` annotation is a full URL. |
+| `GRAFANA_DATASOURCE_UID` | — | The Prometheus data source's uid in Grafana. Set = 📊 Grafana opens Explore on the alert's own expression, from 30 min before it started. |
+| `GRAFANA_ORG_ID` | `1` | |
+| `JIRA_URL` | — | Jira's base URL (Server, Data Center or Cloud). Set = a Jira shortcut. |
+| `JIRA_PROJECT_ID`, `JIRA_ISSUE_TYPE_ID` | — | Numeric ids. Both set = 📝 Jira opens the create form prefilled (summary, description, alerts, a link back to the Mattermost post); unset = 🔎 Jira searches for tickets that mention the alert. |
+| `ALERTMANAGER_URL` | payload `externalURL` | User-facing Alertmanager URL, for the `silence` link. |
+| `PROMETHEUS_URL` | — | Rewrites the origin of `generatorURL`, for the `source` link (usually Prometheus' in-cluster hostname). |
 | `DISPLAY_TZ` | `Asia/Jakarta` | Times shown as `10:02 WIB`. |
 | `MM_PIN_FIRING` | `true` | Pin while firing, unpin on resolve. |
 | `MM_REACTIONS` | `true` | 🔥 while firing, ✅ when resolved (the 👀 chip is `ACK_REACTION`'s, apart from this). |
@@ -61,6 +68,30 @@ Start the bridge with `REMIND_MINUTES=0` to see the "still firing" reminder at s
 | `REMIND_MINUTES` | `60` | Least minutes between "still firing" replies on Alertmanager's repeats; `0` = every repeat, `off` = never. The post's footer is updated on every repeat regardless. |
 | `SUMMARY_MINUTES` | `0` (off) | Re-post the still-firing summary this often. |
 | `LOOKBACK_PAGES` | `3` | Pages of 200 posts read back on start to find the groups' posts. |
+
+## The Grafana and Jira shortcuts
+
+Both are plain links: the bridge never calls Grafana or Jira, so they need no token and no network path
+from the bridge — only from the person clicking.
+
+📊 **Grafana**, first that applies:
+1. the rule's own dashboard — annotation `dashboard_url` (or `grafana_url`, `dashboard`); a path such as
+   `/d/abc/pods?var-namespace={{ $labels.namespace }}` is joined to `GRAFANA_URL`;
+2. with `GRAFANA_DATASOURCE_UID`, Explore on the alert's expression (read from Prometheus' `generatorURL`),
+   from 30 minutes before it started to now (to 15 minutes after the resolve, once resolved);
+3. Grafana's alert list, searched for the alert name.
+
+📝 **Jira** opens `…/secure/CreateIssueDetails!init.jspa` with the project, issue type, a summary such as
+`[critical] KubePodCrashLooping in sample-apps (dev)` and a description listing the alerts and a link back
+to the Mattermost post (the bridge edits the post once right after creating it, to put that link in).
+The ids:
+
+```sh
+curl -s -u "$JIRA_USER:$JIRA_TOKEN" "$JIRA_URL/rest/api/2/project/OPS" | jq -r .id   # project key OPS → JIRA_PROJECT_ID
+curl -s -u "$JIRA_USER:$JIRA_TOKEN" "$JIRA_URL/rest/api/2/issuetype" | jq -r '.[] | "\(.id)  \(.name)"'   # → JIRA_ISSUE_TYPE_ID
+```
+
+(On Jira Server / Data Center, a personal access token goes in `-H "Authorization: Bearer …"` instead of `-u`.)
 
 ## Alertmanager
 

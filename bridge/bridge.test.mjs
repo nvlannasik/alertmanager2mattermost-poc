@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { createBridge, configFromEnv, handler } from "./bridge.mjs";
-import { applyNotification, renderRoot, renderEvent, subjectKeys, span, STATE_PROP, SUMMARY_PROP } from "./card.mjs";
+import { applyNotification, renderRoot, renderEvent, subjectKeys, span, grafanaUrl, jiraUrl, STATE_PROP, SUMMARY_PROP } from "./card.mjs";
 import { fakeMattermost } from "./fake-mm.mjs";
 import { alert, notification, crashLabels, crashAnn, crashGroup, memLabels, memAnn, memGroup } from "./payloads.mjs";
 
@@ -48,9 +48,9 @@ test("an alert absent from a complete notification is no longer firing; from a t
   assert.deepEqual(truncated.events.map((e) => e.type), ["repeat"]);
 });
 
-test("the root renders the state: colour, title, list, links, fields", () => {
+test("CARD_STYLE=detailed: colour, title, list, the old links, fields", () => {
   const { state } = applyNotification(null, notification(crashGroup, [crash("a"), crash("b", { startsAt: iso(2) })]), at(3));
-  const { message, attachments: [att] } = renderRoot(state, { tz: "Asia/Jakarta", now: at(3) });
+  const { message, attachments: [att] } = renderRoot(state, { tz: "Asia/Jakarta", now: at(3), cardStyle: "detailed", cardLinks: ["silence", "source", "runbook"] });
   assert.equal(message, "🔥 **FIRING** · **KubePodCrashLooping** · 🔴 critical · `sample-apps` · 2 of 2 firing");
   assert.equal(att.color, "#d93025");
   assert.equal(att.title, "🔥 FIRING — KubePodCrashLooping");
@@ -65,7 +65,7 @@ test("the root renders the state: colour, title, list, links, fields", () => {
 
 test("PROMETHEUS_URL rewrites the Source link's origin", () => {
   const { state } = applyNotification(null, notification(memGroup, [alert(memLabels, { annotations: memAnn, startsAt: iso(0) })]), at(0));
-  const { attachments: [att] } = renderRoot(state, { prometheusUrl: "https://prometheus.example.org" });
+  const { attachments: [att] } = renderRoot(state, { prometheusUrl: "https://prometheus.example.org", cardLinks: ["source"] });
   assert.match(att.text, /\[📈 Source\]\(https:\/\/prometheus\.example\.org\/graph\?g0\.expr=NodeMemoryHighUtilization\)/);
 });
 
@@ -75,6 +75,83 @@ test("a mention only while firing, and only for the configured severities", () =
   assert.match(renderRoot(crit, { mention: "@channel" }).message, /\n@channel$/);
   assert.doesNotMatch(renderRoot(warn, { mention: "@channel" }).message, /@channel/);
   assert.doesNotMatch(renderRoot({ ...crit, status: "resolved", resolvedAt: iso(9) }, { mention: "@channel" }).message, /@channel/);
+});
+
+// ── the table card (default) and its shortcuts ──────────────────────────────
+
+test("the table card: one status line, a meta line, a row per alert, Grafana and Jira", () => {
+  const { state } = applyNotification(null, notification(crashGroup, [crash("a"), crash("b", { startsAt: iso(2) }), crash("c", { status: "resolved", endsAt: iso(4) })]), at(5));
+  const cfg = { tz: "Asia/Jakarta", now: at(5), grafanaUrl: "https://grafana.example.org/", jiraUrl: "https://jira.example.org", ackReaction: "eyes" };
+  const { message, attachments: [att] } = renderRoot(state, cfg);
+  assert.equal(message, "🔥 **FIRING** · **KubePodCrashLooping** · 🔴 critical · 2 of 3 firing");
+  assert.equal(att.title, "🔥 FIRING — KubePodCrashLooping");
+  assert.equal(att.fields, undefined, "no fields: the meta line carries them");
+  assert.equal(
+    att.text,
+    [
+      "Pod is crash looping. The container restarted 5 times in 10 minutes.",
+      "`sample-apps` · dev · started 10:00 WIB",
+      "",
+      "|  | Pod | Since | Resolved |",
+      "|---|---|---|---|",
+      "| 🔥 | `a` | 10:00 | firing |",
+      "| 🔥 | `b` | 10:02 | firing |",
+      "| ✅ | `c` | 10:00 | 10:04 · 4m |",
+      "",
+      "[📊 Grafana](https://grafana.example.org/alerting/list?search=KubePodCrashLooping) · [🔎 Jira](https://jira.example.org/issues/?jql=text%20~%20%22KubePodCrashLooping%22%20ORDER%20BY%20created%20DESC)",
+      "",
+      "_To acknowledge, click the :eyes: reaction under this post._",
+    ].join("\n")
+  );
+});
+
+test("a single alert with no label to tell it apart gets no table", () => {
+  const { state } = applyNotification(null, notification({ alertname: "Watchdog" }, [alert({ alertname: "Watchdog", severity: "none" }, { annotations: { summary: "Always firing." }, startsAt: iso(0) })]), at(0));
+  const { attachments: [att] } = renderRoot(state, { tz: "Asia/Jakarta", now: at(0) });
+  assert.doesNotMatch(att.text, /\|/);
+});
+
+test("Grafana: the rule's dashboard annotation first, then Explore on the alert's expression, else the alert list", () => {
+  const withDash = applyNotification(null, notification(crashGroup, [crash("a", { annotations: { ...crashAnn, dashboard_url: "/d/abc/pods?var-ns=sample-apps" } })]), at(0)).state;
+  assert.equal(grafanaUrl(withDash, { grafanaUrl: "https://g.test" }), "https://g.test/d/abc/pods?var-ns=sample-apps");
+  assert.equal(grafanaUrl(withDash, {}), undefined, "a relative dashboard path needs GRAFANA_URL");
+
+  const plain = applyNotification(null, notification(crashGroup, [crash("a")]), at(0)).state;
+  const explore = new URL(grafanaUrl(plain, { grafanaUrl: "https://g.test", grafanaDatasource: "prom1" }));
+  assert.equal(explore.pathname, "/explore");
+  const panes = JSON.parse(explore.searchParams.get("panes"));
+  assert.deepEqual(panes.a.queries[0], { refId: "A", expr: "KubePodCrashLooping", datasource: { type: "prometheus", uid: "prom1" } });
+  assert.deepEqual(panes.a.range, { from: String(T0 - 30 * 60_000), to: "now" });
+  assert.equal(grafanaUrl(plain, {}), undefined, "no GRAFANA_URL, no link");
+});
+
+test("Jira: a prefilled create form when the project is configured, linking back to the post", () => {
+  const { state } = applyNotification(null, notification(crashGroup, [crash("a"), crash("b")]), at(0));
+  const j = jiraUrl(state, { jiraUrl: "https://jira.test/", jiraProjectId: "10001", jiraIssueTypeId: "10004", permalink: "https://mm.test/ops/pl/p1", tz: "Asia/Jakarta" });
+  assert.equal(j.label, "📝 Jira");
+  const u = new URL(j.url);
+  assert.equal(u.pathname, "/secure/CreateIssueDetails!init.jspa");
+  assert.equal(u.searchParams.get("pid"), "10001");
+  assert.equal(u.searchParams.get("issuetype"), "10004");
+  assert.equal(u.searchParams.get("summary"), "[critical] KubePodCrashLooping in sample-apps (dev)");
+  const d = u.searchParams.get("description");
+  assert.match(d, /^Pod is crash looping\.\nThe container restarted 5 times in 10 minutes\.\n\nStarted: 27\/11\/2026, 10:00:00 WIB\nAlerts \(2\):\n- FIRING pod=a\n- FIRING pod=b\n\nMattermost: https:\/\/mm\.test\/ops\/pl\/p1$/);
+  assert.equal(jiraUrl(state, {}), undefined);
+});
+
+test("the bridge puts the post's own link into the Jira shortcut right after posting", async () => {
+  const { mm, bridge } = setup({ JIRA_URL: "https://jira.test", JIRA_PROJECT_ID: "10001", JIRA_ISSUE_TYPE_ID: "10004" });
+  const { postId } = await bridge.notify(notification(crashGroup, [crash("a")]));
+  const text = mm.root(postId).props.attachments[0].text;
+  const jira = new URL(text.match(/\[📝 Jira\]\(([^)]+)\)/)[1]);
+  assert.match(jira.searchParams.get("description"), new RegExp(`Mattermost: https://mm\\.test/ops/pl/${postId}$`));
+});
+
+test("CARD_LINKS chooses the shortcuts and their order", () => {
+  const { state } = applyNotification(null, notification(crashGroup, [crash("a")]), at(0));
+  const cfg = { grafanaUrl: "https://g.test", jiraUrl: "https://j.test", cardLinks: ["jira", "runbook", "grafana"] };
+  const links = renderRoot(state, cfg).attachments[0].text.split("\n").find((l) => l.includes("Jira"));
+  assert.match(links, /^\[🔎 Jira\]\(.+\) · \[📘 Runbook\]\(.+\) · \[📊 Grafana\]\(.+\)$/);
 });
 
 // ── the bridge, against a fake Mattermost ───────────────────────────────────
@@ -96,7 +173,7 @@ test("firing → one post, pinned, 🔥; resolved → the SAME post edited green
   assert.match(post.message, /^✅ \*\*RESOLVED\*\* · \*\*KubePodCrashLooping\*\*/);
   assert.equal(post.props.attachments[0].color, "#188038");
   assert.equal(post.props.attachments[0].title, "✅ RESOLVED — KubePodCrashLooping");
-  assert.match(post.props.attachments[0].fields.find((f) => f.title === "Resolved").value, /^10:37 WIB · after 37m$/);
+  assert.match(post.props.attachments[0].text, /^`sample-apps` · dev · started 10:00 WIB · resolved 10:37 · after 37m$/m);
   assert.equal(post.props.from_bot, "true", "server props survive the patch");
   assert.ok(!mm.pins.has(id));
   assert.ok(!mm.reacted(id, "fire") && mm.reacted(id, "white_check_mark"));
@@ -113,7 +190,7 @@ test("a group's changes land in its thread; the root always shows the whole grou
   assert.deepEqual(mm.thread(postId), ["✅ **1 resolved** — `pod=a` · 1 still firing", "🔥 **1 more firing** — `pod=c` · 2 firing now"]);
   const root = mm.root(postId);
   assert.match(root.message, /2 of 3 firing$/);
-  assert.match(root.props.attachments[0].text, /🔥 `pod=b` · since 10:00\n🔥 `pod=c` · since 10:09\n✅ `pod=a` · resolved 10:04 after 4m/);
+  assert.match(root.props.attachments[0].text, /\| 🔥 \| `b` \| 10:00 \| firing \|\n\| 🔥 \| `c` \| 10:09 \| firing \|\n\| ✅ \| `a` \| 10:00 \| 10:04 · 4m \|/);
 });
 
 test("Alertmanager's repeats: a reminder in the thread at most every REMIND_MINUTES", async () => {
@@ -212,7 +289,7 @@ test("Acknowledge: the button, the click, the post turns purple with who, the bu
   const att = mm.root(postId).props.attachments[0];
   assert.equal(att.color, "#9334e6");
   assert.equal(att.title, "👀 FIRING · ACKNOWLEDGED — KubePodCrashLooping");
-  assert.equal(att.fields.find((f) => f.title === "Acknowledged").value, "@rina · 10:03");
+  assert.match(att.text, / · 👀 @rina · 10:03$/m);
   assert.equal(att.actions, undefined);
   assert.deepEqual(mm.thread(postId), ["👀 Acknowledged by @rina"]);
   assert.match((await bridge.action({ post_id: postId, user_name: "budi", context: button.integration.context })).body.ephemeral_text, /Already acknowledged by @rina/);
@@ -230,7 +307,7 @@ test("a click that reaches a restarted bridge before any notification still find
   const two = createBridge({ mm, cfg, log: { ...quiet, info: (m) => logged.push(m) }, now: () => at(5) }); // restarted, nothing read yet
   const r = await two.action({ post_id: postId, user_name: "rina", context: { action: "ack" } });
   assert.match(r.body.ephemeral_text, /^Acknowledged/);
-  assert.equal(mm.root(postId).props.attachments[0].fields.find((f) => f.title === "Acknowledged").value, "@rina · 10:05");
+  assert.match(mm.root(postId).props.attachments[0].text, / · 👀 @rina · 10:05$/m);
   assert.ok(logged.some((m) => /click ack by rina on post p1 → 200 Acknowledged/.test(m)), "every click is logged with its outcome");
 });
 
@@ -253,7 +330,7 @@ test("acknowledge by reaction: the bot's 👀 chip is the button, read back in o
 
   const att = mm.root(postId).props.attachments[0];
   assert.equal(att.color, "#9334e6");
-  assert.equal(att.fields.find((f) => f.title === "Acknowledged").value, "@user-u7 · 10:03", "the time of the click, not of the poll");
+  assert.match(att.text, / · 👀 @user-u7 · 10:03$/m, "the time of the click, not of the poll");
   assert.doesNotMatch(att.text, /To acknowledge/);
   assert.deepEqual(mm.thread(postId), ["👀 Acknowledged by @user-u7"]);
   assert.ok(!mm.reacted(postId, "eyes", "bot1") && mm.reacted(postId, "eyes", "u7"), "the bot's chip goes, the acknowledger's stays");
@@ -288,7 +365,7 @@ test("button and reaction share one acknowledge: the second one is told who has 
   setNow(2);
   await bridge.action({ post_id: postId, user_name: "rina", context: { action: "ack" } });
   assert.equal(await bridge.pollAcks(), 0, "already acknowledged by the button");
-  assert.equal(mm.root(postId).props.attachments[0].fields.find((f) => f.title === "Acknowledged").value, "@rina · 10:02");
+  assert.match(mm.root(postId).props.attachments[0].text, / · 👀 @rina · 10:02$/m);
   assert.equal(mm.thread(postId).length, 1);
 });
 

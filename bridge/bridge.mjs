@@ -23,6 +23,15 @@ export function configFromEnv(env = process.env) {
     channel: env.MM_CHANNEL,
     token: env.BRIDGE_TOKEN || "",
     actionUrl: bridgeUrl ? `${bridgeUrl}/action` : "",
+    // the card: "table" (default) or "detailed", and its shortcut links in order
+    cardStyle: env.CARD_STYLE === "detailed" ? "detailed" : "table",
+    cardLinks: (env.CARD_LINKS ?? "grafana,jira").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean),
+    grafanaUrl: env.GRAFANA_URL || "",
+    grafanaDatasource: env.GRAFANA_DATASOURCE_UID || "",
+    grafanaOrgId: env.GRAFANA_ORG_ID || "1",
+    jiraUrl: env.JIRA_URL || "",
+    jiraProjectId: env.JIRA_PROJECT_ID || "",
+    jiraIssueTypeId: env.JIRA_ISSUE_TYPE_ID || "",
     alertmanagerUrl: env.ALERTMANAGER_URL || "",
     prometheusUrl: env.PROMETHEUS_URL || "",
     tz: env.DISPLAY_TZ || "Asia/Jakarta",
@@ -108,7 +117,7 @@ export function createBridge({ mm, cfg, log = console, now = () => new Date() })
   const reply = (ch, rootId, message) => message && mm.post(ch.id, { message }, rootId).catch(soft("thread reply"));
   const patch = (entry) => mm.update(entry.postId, rootProps(entry));
   function rootProps(entry) {
-    const { message, attachments } = renderRoot(entry.state, renderCfg());
+    const { message, attachments } = renderRoot(entry.state, { ...renderCfg(), permalink: entry.postId ? permalink(entry.postId) : "" });
     return { message, props: { ...entry.extra, attachments, [STATE_PROP]: entry.state } };
   }
   async function markFiring(postId) {
@@ -147,6 +156,8 @@ export function createBridge({ mm, cfg, log = console, now = () => new Date() })
         entry.postId = post.id;
         entry.extra = extraProps(post.props);
         remember(ch, key, entry);
+        // The Jira ticket links back to this post, whose id exists only now: one edit to put it in.
+        if (cfg.cardLinks.includes("jira") && cfg.jiraUrl && cfg.jiraProjectId && cfg.jiraIssueTypeId) await patch(entry).catch(soft("adding the post link to the Jira shortcut"));
         if (state.status === "firing") await markFiring(post.id);
         else if (cfg.reactions) await mm.react((await self()).id, post.id, "white_check_mark").catch(soft("reaction"));
         if (state.previous) await reply(ch, prev.postId, `🔁 **Fired again** → [new post](${permalink(post.id)})`);
@@ -318,7 +329,7 @@ async function main() {
   if (cfg.summaryMinutes > 0) setInterval(() => bridge.summarize().catch((e) => console.error(`[bridge] summary: ${e.message}`)), cfg.summaryMinutes * 60_000);
   createServer(handler(bridge, cfg)).listen(cfg.port, () =>
     console.log(
-      `alert bridge on :${cfg.port} → ~${cfg.channel}${dry ? " (dry run)" : ""} · pin ${cfg.pin ? "on" : "off"} · ack ${[cfg.ackReaction && `:${cfg.ackReaction}: reaction every ${cfg.ackPollSeconds}s`, cfg.actionUrl && "button"].filter(Boolean).join(" + ") || "off"} · webhook auth ${cfg.token ? "on" : "OFF"}`
+      `alert bridge on :${cfg.port} → ~${cfg.channel}${dry ? " (dry run)" : ""} · card ${cfg.cardStyle} [${cfg.cardLinks.join(", ")}] · pin ${cfg.pin ? "on" : "off"} · ack ${[cfg.ackReaction && `:${cfg.ackReaction}: reaction every ${cfg.ackPollSeconds}s`, cfg.actionUrl && "button"].filter(Boolean).join(" + ") || "off"} · webhook auth ${cfg.token ? "on" : "OFF"}`
     )
   );
 }
