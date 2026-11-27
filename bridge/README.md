@@ -97,6 +97,20 @@ firing post the bridge never saw is posted on its own, green, saying so.
 - With *Collapsed Reply Threads* on, thread replies notify the thread's followers only; the root post's
   colour and the pinned list are what the channel sees.
 
+### The Acknowledge button does nothing when clicked
+
+The click is sent by the Mattermost **server**, not by your browser: it POSTs to `BRIDGE_URL/action`. The
+bridge logs every click it receives — `[bridge] click ack by <user> on post <id> → <status> <answer>`:
+
+- **No such line** — the click never reached the bridge. The Mattermost server cannot reach `BRIDGE_URL`
+  (firewall, NAT, a laptop on another network: this is the bridge's one inbound path), or it refuses a
+  private address until the host is listed in *System Console → Environment → Developer → Allow untrusted
+  internal connections to*. The Mattermost server's log names which.
+- **`→ 403`** — the post carries a different secret: it was made while the bridge ran with another `BRIDGE_TOKEN`.
+- **`not tracked`** — the post is older than `LOOKBACK_PAGES` × 200 posts, or in a channel other than `MM_CHANNEL`.
+
+Without `BRIDGE_URL` there is no button and no inbound path from Mattermost at all.
+
 ## Tests
 
 ```sh

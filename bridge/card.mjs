@@ -310,7 +310,7 @@ export function renderRoot(state, cfg = {}) {
   const title = `${isFiring ? (state.ack ? "👀 FIRING · ACKNOWLEDGED" : "🔥 FIRING") : "✅ RESOLVED"} — ${state.alertname}`;
   const actions =
     isFiring && !state.ack && cfg.actionUrl
-      ? [{ id: "ack", name: "👀 Acknowledge", style: "primary", integration: { url: cfg.actionUrl, context: { action: "ack", ...(cfg.secret ? { secret: cfg.secret } : {}) } } }]
+      ? [{ id: "ack", type: "button", name: "👀 Acknowledge", style: "primary", integration: { url: cfg.actionUrl, context: { action: "ack", ...(cfg.secret ? { secret: cfg.secret } : {}) } } }]
       : [];
   const attachment = {
     fallback: message.replace(/\*\*/g, "").split("\n")[0],

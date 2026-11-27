@@ -203,6 +203,7 @@ test("Acknowledge: the button, the click, the post turns purple with who, the bu
   const { postId } = await bridge.notify(notification(crashGroup, [crash("a")]));
   const [button] = mm.root(postId).props.attachments[0].actions;
   assert.deepEqual(button.integration, { url: "http://bridge.test:8080/action", context: { action: "ack", secret: "s3cret" } });
+  assert.equal(button.type, "button");
 
   assert.equal((await bridge.action({ post_id: postId, user_name: "rina", context: { action: "ack", secret: "wrong" } })).status, 403);
   setNow(3);
@@ -219,6 +220,18 @@ test("Acknowledge: the button, the click, the post turns purple with who, the bu
   setNow(70);
   await bridge.notify(notification(crashGroup, [crash("a")]));
   assert.match(mm.thread(postId).at(-1), /acknowledged by @rina$/);
+});
+
+test("a click that reaches a restarted bridge before any notification still finds its post", async () => {
+  const { mm, cfg } = setup({ BRIDGE_URL: "http://bridge.test:8080" });
+  const one = createBridge({ mm, cfg, log: quiet, now: () => at(0) });
+  const { postId } = await one.notify(notification(crashGroup, [crash("a")]));
+  const logged = [];
+  const two = createBridge({ mm, cfg, log: { ...quiet, info: (m) => logged.push(m) }, now: () => at(5) }); // restarted, nothing read yet
+  const r = await two.action({ post_id: postId, user_name: "rina", context: { action: "ack" } });
+  assert.match(r.body.ephemeral_text, /^Acknowledged/);
+  assert.equal(mm.root(postId).props.attachments[0].fields.find((f) => f.title === "Acknowledged").value, "@rina · 10:05");
+  assert.ok(logged.some((m) => /click ack by rina on post p1 → 200 Acknowledged/.test(m)), "every click is logged with its outcome");
 });
 
 test("the still-firing summary re-posts at the bottom and deletes the last one", async () => {

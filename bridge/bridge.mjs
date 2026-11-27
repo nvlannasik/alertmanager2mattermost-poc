@@ -167,10 +167,18 @@ export function createBridge({ mm, cfg, log = console, now = () => new Date() })
     });
   }
 
-  /** A Mattermost button click. Returns the JSON Mattermost shows the clicker. */
+  /** A Mattermost button click. Returns the JSON Mattermost shows the clicker. Every click is logged with its outcome. */
   async function action(p) {
-    if (cfg.token && p?.context?.secret !== cfg.token) return { status: 403, body: { ephemeral_text: "Not authorized." } };
+    const result = await decide(p);
+    log.info(`[bridge] click ${p?.context?.action ?? "?"} by ${p?.user_name || p?.user_id || "?"} on post ${p?.post_id ?? "?"} → ${result.status} ${result.body.ephemeral_text}`);
+    return result;
+  }
+
+  async function decide(p) {
+    if (cfg.token && p?.context?.secret !== cfg.token) return { status: 403, body: { ephemeral_text: "Not authorized (the button's secret does not match BRIDGE_TOKEN)." } };
     if (p?.context?.action !== "ack") return { status: 200, body: { ephemeral_text: `Unknown action \`${p?.context?.action}\`.` } };
+    // A click can be the first thing a restarted bridge hears: read the default channel back before giving up.
+    if (!byPost.has(p.post_id) && cfg.channel) await channel(cfg.channel).catch(soft("reading the channel back"));
     const at = byPost.get(p.post_id);
     if (!at) return { status: 200, body: { ephemeral_text: "This alert is not tracked by the bridge any more." } };
     const by = p.user_name || (await mm.user(p.user_id).then((u) => u.username, () => p.user_id));
@@ -182,7 +190,6 @@ export function createBridge({ mm, cfg, log = console, now = () => new Date() })
       await patch(entry);
       remember(at.ch, at.key, entry);
       await reply(at.ch, entry.postId, renderEvent({ type: "ack", by }, entry.state, renderCfg()));
-      log.info(`[bridge] ${entry.state.alertname}: acknowledged by @${by}`);
       return { status: 200, body: { ephemeral_text: "Acknowledged — the post shows your name." } };
     });
   }
@@ -268,6 +275,7 @@ async function main() {
     }
   }
   const bridge = createBridge({ mm: mattermost({ dry }), cfg });
+  bridge.channel(cfg.channel).catch((e) => console.error(`[bridge] could not read ~${cfg.channel} at startup (retried on the next notification): ${e.message}`));
   if (cfg.summaryMinutes > 0) setInterval(() => bridge.summarize().catch((e) => console.error(`[bridge] summary: ${e.message}`)), cfg.summaryMinutes * 60_000);
   createServer(handler(bridge, cfg)).listen(cfg.port, () =>
     console.log(
