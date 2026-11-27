@@ -85,7 +85,7 @@ test("firing → one post, pinned, 🔥; resolved → the SAME post edited green
   assert.equal(r1.action, "created");
   const id = r1.postId;
   assert.ok(mm.pins.has(id));
-  assert.ok(mm.reactions.has(`${id}:fire`));
+  assert.ok(mm.reacted(id, "fire"));
   assert.equal(mm.root(id).props.attachments[0].color, "#d93025");
 
   setNow(38);
@@ -99,7 +99,7 @@ test("firing → one post, pinned, 🔥; resolved → the SAME post edited green
   assert.match(post.props.attachments[0].fields.find((f) => f.title === "Resolved").value, /^10:37 WIB · after 37m$/);
   assert.equal(post.props.from_bot, "true", "server props survive the patch");
   assert.ok(!mm.pins.has(id));
-  assert.ok(!mm.reactions.has(`${id}:fire`) && mm.reactions.has(`${id}:white_check_mark`));
+  assert.ok(!mm.reacted(id, "fire") && mm.reacted(id, "white_check_mark"));
   assert.deepEqual(mm.thread(id), ["✅ **All resolved** at 10:37 WIB · after 37m"]);
 });
 
@@ -232,6 +232,64 @@ test("a click that reaches a restarted bridge before any notification still find
   assert.match(r.body.ephemeral_text, /^Acknowledged/);
   assert.equal(mm.root(postId).props.attachments[0].fields.find((f) => f.title === "Acknowledged").value, "@rina · 10:05");
   assert.ok(logged.some((m) => /click ack by rina on post p1 → 200 Acknowledged/.test(m)), "every click is logged with its outcome");
+});
+
+test("acknowledge by reaction: the bot's 👀 chip is the button, read back in one bulk call", async () => {
+  const { mm, bridge, setNow } = setup(); // ACK_REACTION defaults to eyes, no BRIDGE_URL: no inbound at all
+  const { postId } = await bridge.notify(notification(crashGroup, [crash("a")]));
+  const other = await bridge.notify(notification(memGroup, [alert(memLabels, { startsAt: iso(0) })]));
+  assert.ok(mm.reacted(postId, "eyes", "bot1"), "the bot puts the chip under the post");
+  assert.match(mm.root(postId).props.attachments[0].text, /_To acknowledge, click the :eyes: reaction under this post\._$/);
+  assert.equal(mm.root(postId).props.attachments[0].actions, undefined, "no button without BRIDGE_URL");
+
+  // nothing to acknowledge yet: the bot's own chip and another emoji do not count
+  await mm.react("u7", postId, "fire", at(2).getTime());
+  assert.equal(await bridge.pollAcks(), 0);
+  await mm.react("u7", postId, "eyes", at(3).getTime());
+  setNow(4);
+  const calls = mm.calls.length;
+  assert.equal(await bridge.pollAcks(), 1);
+  assert.deepEqual(mm.calls.slice(calls).filter((c) => c[0] === "reactionsFor").map((c) => c[1].sort()), [[postId, other.postId].sort()], "one bulk read for every open post");
+
+  const att = mm.root(postId).props.attachments[0];
+  assert.equal(att.color, "#9334e6");
+  assert.equal(att.fields.find((f) => f.title === "Acknowledged").value, "@user-u7 · 10:03", "the time of the click, not of the poll");
+  assert.doesNotMatch(att.text, /To acknowledge/);
+  assert.deepEqual(mm.thread(postId), ["👀 Acknowledged by @user-u7"]);
+  assert.ok(!mm.reacted(postId, "eyes", "bot1") && mm.reacted(postId, "eyes", "u7"), "the bot's chip goes, the acknowledger's stays");
+
+  // acknowledged posts are not read again; the other post is
+  const before = mm.calls.length;
+  await bridge.pollAcks();
+  assert.deepEqual(mm.calls.slice(before).filter((c) => c[0] === "reactionsFor").map((c) => c[1]), [[other.postId]]);
+});
+
+test("a resolve takes the bot's 👀 chip away; ACK_REACTION=off puts none", async () => {
+  const { mm, bridge, setNow } = setup();
+  const { postId } = await bridge.notify(notification(crashGroup, [crash("a")]));
+  setNow(5);
+  await bridge.notify(notification(crashGroup, [crash("a", { status: "resolved", endsAt: iso(5) })]));
+  assert.ok(!mm.reacted(postId, "eyes"));
+  assert.doesNotMatch(mm.root(postId).props.attachments[0].text, /To acknowledge/);
+  assert.equal(await bridge.pollAcks(), 0);
+
+  const off = setup({ ACK_REACTION: "off" });
+  const r = await off.bridge.notify(notification(crashGroup, [crash("a")]));
+  assert.ok(!off.mm.reacted(r.postId, "eyes"));
+  assert.doesNotMatch(off.mm.root(r.postId).props.attachments[0].text, /To acknowledge/);
+  assert.equal(await off.bridge.pollAcks(), 0);
+  assert.ok(!off.mm.calls.some((c) => c[0] === "reactionsFor"));
+});
+
+test("button and reaction share one acknowledge: the second one is told who has it", async () => {
+  const { mm, bridge, setNow } = setup({ BRIDGE_URL: "http://bridge.test:8080" });
+  const { postId } = await bridge.notify(notification(crashGroup, [crash("a")]));
+  await mm.react("u7", postId, "eyes", at(1).getTime());
+  setNow(2);
+  await bridge.action({ post_id: postId, user_name: "rina", context: { action: "ack" } });
+  assert.equal(await bridge.pollAcks(), 0, "already acknowledged by the button");
+  assert.equal(mm.root(postId).props.attachments[0].fields.find((f) => f.title === "Acknowledged").value, "@rina · 10:02");
+  assert.equal(mm.thread(postId).length, 1);
 });
 
 test("the still-firing summary re-posts at the bottom and deletes the last one", async () => {

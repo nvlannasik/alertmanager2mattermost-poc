@@ -13,7 +13,7 @@ What keeps an alert from sinking or being missed:
 | **🔥 / ✅ reaction** | Visible in the channel view without opening anything. |
 | **The thread is the timeline** | "1 more firing", "1 resolved · 2 still firing", "⏰ Still firing · 4h · not acknowledged", "✅ All resolved after 38m". |
 | **Firing again = a new post at the bottom** | Never an old post turned red again higher up. The new one links the previous one, the previous one's thread links the new one. |
-| **👀 Acknowledge button** (optional) | The post turns purple and says who has it; reminders and the summary say "not acknowledged" until someone does. |
+| **👀 Acknowledge by reaction** | The bot puts a 👀 reaction under every firing post; one click on it acknowledges. The post turns purple and says who has it; reminders and the summary say "not acknowledged" until someone does. No inbound connection: the bridge reads the reactions back over REST. |
 | **Still-firing summary** (optional) | Every `SUMMARY_MINUTES`, one list of what is still firing, oldest first, re-posted at the bottom; the previous one is deleted. |
 
 The group's state is stored in its own post (`props.am_bridge`), so the bridge keeps no database and
@@ -37,7 +37,7 @@ Try it without an Alertmanager (terminal 2):
 
 ```sh
 node send-test-alerts.mjs            # 8 steps, 4 s apart: two groups fire, partly resolve, repeat, resolve, fire again
-node send-test-alerts.mjs --step     # Enter between steps
+node send-test-alerts.mjs --step     # Enter between steps — click 👀 on a firing post before it resolves
 ```
 
 Start the bridge with `REMIND_MINUTES=0` to see the "still firing" reminder at step 5.
@@ -49,12 +49,14 @@ Start the bridge with `REMIND_MINUTES=0` to see the "still firing" reminder at s
 | `MM_URL`, `MM_TOKEN`, `MM_TEAM`, `MM_CHANNEL` | — | Required. `MM_CHANNEL` is the default; `?channel=<name>` on the webhook URL routes a receiver elsewhere. |
 | `PORT` | `8080` | |
 | `BRIDGE_TOKEN` | — | Required bearer token on `/alertmanager`, and the secret inside the Acknowledge button. Unset = no auth (PoC only). |
-| `BRIDGE_URL` | — | The bridge's URL **as the Mattermost server reaches it** (e.g. `http://10.0.0.5:8080`). Set = the Acknowledge button. |
+| `ACK_REACTION` | `eyes` | The emoji that acknowledges (👀). `off` = no acknowledge by reaction. |
+| `ACK_POLL_SECONDS` | `30` | How often the reactions of the unacknowledged firing posts are read — one bulk request (`POST /posts/ids/reactions`) per round, none while nothing is open. |
+| `BRIDGE_URL` | — | Optional, and the ONE inbound path: the bridge's URL **as the Mattermost server reaches it** (e.g. `http://10.0.0.5:8080`). Set = an Acknowledge button as well. |
 | `ALERTMANAGER_URL` | payload `externalURL` | User-facing Alertmanager URL for the 🔕 Silence link. |
 | `PROMETHEUS_URL` | — | Rewrites the origin of `generatorURL` (📈 Source), which is usually Prometheus' in-cluster hostname. |
 | `DISPLAY_TZ` | `Asia/Jakarta` | Times shown as `10:02 WIB`. |
 | `MM_PIN_FIRING` | `true` | Pin while firing, unpin on resolve. |
-| `MM_REACTIONS` | `true` | 🔥 while firing, ✅ when resolved. |
+| `MM_REACTIONS` | `true` | 🔥 while firing, ✅ when resolved (the 👀 chip is `ACK_REACTION`'s, apart from this). |
 | `MM_MENTION` | — | E.g. `@channel` or `@oncall`, added to a NEW post whose severity is in `MM_MENTION_SEVERITIES` (default `critical`). Edits never notify, so it is only on the first post. |
 | `REMIND_MINUTES` | `60` | Least minutes between "still firing" replies on Alertmanager's repeats; `0` = every repeat, `off` = never. The post's footer is updated on every repeat regardless. |
 | `SUMMARY_MINUTES` | `0` (off) | Re-post the still-firing summary this often. |
@@ -97,7 +99,13 @@ firing post the bridge never saw is posted on its own, green, saying so.
 - With *Collapsed Reply Threads* on, thread replies notify the thread's followers only; the root post's
   colour and the pinned list are what the channel sees.
 
-### The Acknowledge button does nothing when clicked
+### Acknowledge
+
+By default acknowledging needs nothing from the network but what posting needs: the bot reacts 👀 under
+every firing post, the first person to click that chip acknowledges (at the time they clicked), the bot's
+own chip goes and theirs stays. The post is updated within `ACK_POLL_SECONDS`.
+
+### The optional Acknowledge button does nothing when clicked
 
 The click is sent by the Mattermost **server**, not by your browser: it POSTs to `BRIDGE_URL/action`. The
 bridge logs every click it receives — `[bridge] click ack by <user> on post <id> → <status> <answer>`:

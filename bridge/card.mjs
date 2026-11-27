@@ -241,8 +241,8 @@ const byStart = (a, b) => Date.parse(a.startsAt) - Date.parse(b.startsAt);
 const byEndDesc = (a, b) => Date.parse(b.endsAt ?? 0) - Date.parse(a.endsAt ?? 0);
 
 /**
- * The group's post. `cfg`: { tz, now, alertmanagerUrl, prometheusUrl, actionUrl, secret, mention,
- * mentionSeverities, maxLines }. Text that must notify (the mention) stays in `message`.
+ * The group's post. `cfg`: { tz, now, alertmanagerUrl, prometheusUrl, actionUrl, secret, ackReaction,
+ * mention, mentionSeverities, maxLines }. Text that must notify (the mention) stays in `message`.
  */
 export function renderRoot(state, cfg = {}) {
   const tz = cfg.tz ?? "UTC";
@@ -296,6 +296,7 @@ export function renderRoot(state, cfg = {}) {
     runbook && `[📘 Runbook](${runbook})`,
   ].filter(Boolean);
   if (links.length) lines.push("", links.join(" · "));
+  if (isFiring && !state.ack && cfg.ackReaction) lines.push("", `_To acknowledge, click the :${cfg.ackReaction}: reaction under this post._`);
 
   const tzName = tzLabel(tz);
   const fields = [

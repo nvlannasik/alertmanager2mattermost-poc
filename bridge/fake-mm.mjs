@@ -7,7 +7,7 @@ export function fakeMattermost({ botId = "bot1", channelId = "ch1" } = {}) {
   let clock = 1_000;
   const posts = new Map();
   const pins = new Set();
-  const reactions = new Set(); // `${postId}:${emoji}`
+  const reactions = new Map(); // `${postId}|${userId}|${emoji}` → create_at (ms)
   const calls = [];
   const fail = new Set(); // method names that throw once
   const call = (name, ...args) => {
@@ -66,13 +66,22 @@ export function fakeMattermost({ botId = "bot1", channelId = "ch1" } = {}) {
       call("unpin", id);
       pins.delete(id);
     },
-    async react(userId, postId, emoji) {
+    async react(userId, postId, emoji, at = Date.now()) {
       call("react", userId, postId, emoji);
-      reactions.add(`${postId}:${emoji}`);
+      reactions.set(`${postId}|${userId}|${emoji}`, at);
     },
     async unreact(userId, postId, emoji) {
       call("unreact", userId, postId, emoji);
-      reactions.delete(`${postId}:${emoji}`);
+      reactions.delete(`${postId}|${userId}|${emoji}`);
+    },
+    async reactionsFor(postIds) {
+      call("reactionsFor", postIds);
+      const out = {};
+      for (const [k, create_at] of reactions) {
+        const [post_id, user_id, emoji_name] = k.split("|");
+        if (postIds.includes(post_id)) (out[post_id] ??= []).push({ post_id, user_id, emoji_name, create_at });
+      }
+      return out;
     },
     async channelPosts(channelId, page = 0, perPage = 200) {
       call("channelPosts", channelId, page);
@@ -84,6 +93,10 @@ export function fakeMattermost({ botId = "bot1", channelId = "ch1" } = {}) {
       return list([...pins].filter((id) => posts.get(id)?.channel_id === channelId));
     },
     /** Test helpers */
+    reacted: (postId, emoji, userId) => [...reactions.keys()].some((k) => {
+      const [p, u, e] = k.split("|");
+      return p === postId && e === emoji && (!userId || u === userId);
+    }),
     root: (id) => posts.get(id),
     thread: (id) => [...posts.values()].filter((p) => p.root_id === id).map((p) => p.message),
     roots: () => [...posts.values()].filter((p) => !p.root_id && !p.delete_at),

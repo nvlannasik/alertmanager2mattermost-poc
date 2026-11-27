@@ -33,6 +33,10 @@ export function configFromEnv(env = process.env) {
     // minimum minutes between "still firing" replies on Alertmanager's repeats; 0 = every repeat, off = never
     remindMinutes: /^(off|never|-1)$/i.test(env.REMIND_MINUTES ?? "") ? Infinity : Number(env.REMIND_MINUTES ?? 60),
     summaryMinutes: Number(env.SUMMARY_MINUTES ?? 0),
+    // Acknowledge by reaction, no inbound: the bot puts this emoji under every firing post and anyone else's
+    // click on it acknowledges, read back every ACK_POLL_SECONDS. "off" = none.
+    ackReaction: /^(off|none|false|0)$/i.test(env.ACK_REACTION ?? "") ? "" : env.ACK_REACTION || "eyes",
+    ackPollSeconds: Number(env.ACK_POLL_SECONDS ?? 30),
     lookbackPages: Number(env.LOOKBACK_PAGES ?? 3),
   };
 }
@@ -60,6 +64,8 @@ export function createBridge({ mm, cfg, log = console, now = () => new Date() })
   const permalink = (postId) => `${mm.url}/${cfg.team}/pl/${postId}`;
   const renderCfg = () => ({ ...cfg, secret: cfg.token, now: now() });
   const soft = (what) => (e) => log.warn(`[bridge] ${what} failed: ${e.message}`);
+  const names = new Map();
+  const username = async (id) => names.get(id) ?? mm.user(id).then((u) => (names.set(id, u.username), u.username), () => id);
 
   function remember(ch, key, entry) {
     ch.groups.set(key, entry);
@@ -109,6 +115,8 @@ export function createBridge({ mm, cfg, log = console, now = () => new Date() })
     const { id } = await self();
     if (cfg.pin) await mm.pin(postId).catch(soft("pin"));
     if (cfg.reactions) await mm.react(id, postId, "fire").catch(soft("reaction"));
+    // the acknowledge "button": one click on this reaction chip
+    if (cfg.ackReaction) await mm.react(id, postId, cfg.ackReaction).catch(soft("ack reaction"));
   }
   async function markResolved(postId) {
     const { id } = await self();
@@ -117,6 +125,7 @@ export function createBridge({ mm, cfg, log = console, now = () => new Date() })
       await mm.unreact(id, postId, "fire").catch(soft("reaction removal"));
       await mm.react(id, postId, "white_check_mark").catch(soft("reaction"));
     }
+    if (cfg.ackReaction) await mm.unreact(id, postId, cfg.ackReaction).catch(soft("ack reaction removal"));
   }
 
   /** One Alertmanager notification. Throws on a Mattermost failure, so Alertmanager retries it. */
@@ -181,17 +190,46 @@ export function createBridge({ mm, cfg, log = console, now = () => new Date() })
     if (!byPost.has(p.post_id) && cfg.channel) await channel(cfg.channel).catch(soft("reading the channel back"));
     const at = byPost.get(p.post_id);
     if (!at) return { status: 200, body: { ephemeral_text: "This alert is not tracked by the bridge any more." } };
-    const by = p.user_name || (await mm.user(p.user_id).then((u) => u.username, () => p.user_id));
+    const r = await acknowledge(at, p.user_name || (await username(p.user_id)), now());
+    return { status: 200, body: { ephemeral_text: r.text } };
+  }
+
+  /** The one acknowledge path, for the button and the reaction alike. */
+  function acknowledge(at, by, when) {
     return serial(`${at.ch.id}|${at.key}`, async () => {
       const prev = at.ch.groups.get(at.key);
-      if (prev.state.status !== "firing") return { status: 200, body: { ephemeral_text: "Already resolved." } };
-      if (prev.state.ack) return { status: 200, body: { ephemeral_text: `Already acknowledged by @${prev.state.ack.by}.` } };
-      const entry = { ...prev, state: { ...prev.state, ack: { by, at: now().toISOString() } } };
+      if (prev.state.status !== "firing") return { ok: false, text: "Already resolved." };
+      if (prev.state.ack) return { ok: false, text: `Already acknowledged by @${prev.state.ack.by}.` };
+      const entry = { ...prev, state: { ...prev.state, ack: { by, at: when.toISOString() } } };
       await patch(entry);
       remember(at.ch, at.key, entry);
       await reply(at.ch, entry.postId, renderEvent({ type: "ack", by }, entry.state, renderCfg()));
-      return { status: 200, body: { ephemeral_text: "Acknowledged — the post shows your name." } };
+      // the bot's own chip goes; the acknowledger's stays
+      if (cfg.ackReaction) await mm.unreact((await self()).id, entry.postId, cfg.ackReaction).catch(soft("ack reaction removal"));
+      log.info(`[bridge] ${entry.state.alertname}: acknowledged by @${by}`);
+      return { ok: true, text: "Acknowledged — the post shows your name." };
     });
+  }
+
+  /**
+   * Acknowledge by reaction: ONE bulk read of the reactions on every unacknowledged firing post. The first
+   * person (not the bot) to click the ack emoji acknowledges, at the time they clicked. Returns how many.
+   */
+  async function pollAcks() {
+    if (!cfg.ackReaction) return 0;
+    const open = (await firing()).filter((e) => !e.state.ack);
+    if (open.length === 0) return 0;
+    const { id: botId } = await self();
+    const byPostId = await mm.reactionsFor(open.map((e) => e.postId));
+    let acked = 0;
+    for (const e of open) {
+      const list = Array.isArray(byPostId?.[e.postId]) ? byPostId[e.postId] : [];
+      const first = list.filter((r) => r.emoji_name === cfg.ackReaction && r.user_id !== botId).sort((a, b) => a.create_at - b.create_at)[0];
+      if (!first) continue;
+      const r = await acknowledge({ ch: e.ch, key: e.state.groupKey }, await username(first.user_id), first.create_at > 0 ? new Date(first.create_at) : now());
+      if (r.ok) acked++;
+    }
+    return acked;
   }
 
   async function firing() {
@@ -218,7 +256,7 @@ export function createBridge({ mm, cfg, log = console, now = () => new Date() })
     }
   }
 
-  return { notify, action, firing, summarize, channel };
+  return { notify, action, pollAcks, firing, summarize, channel };
 }
 
 const readJson = (req) =>
@@ -276,10 +314,11 @@ async function main() {
   }
   const bridge = createBridge({ mm: mattermost({ dry }), cfg });
   bridge.channel(cfg.channel).catch((e) => console.error(`[bridge] could not read ~${cfg.channel} at startup (retried on the next notification): ${e.message}`));
+  if (cfg.ackReaction && cfg.ackPollSeconds > 0) setInterval(() => bridge.pollAcks().catch((e) => console.error(`[bridge] reading ack reactions: ${e.message}`)), cfg.ackPollSeconds * 1000);
   if (cfg.summaryMinutes > 0) setInterval(() => bridge.summarize().catch((e) => console.error(`[bridge] summary: ${e.message}`)), cfg.summaryMinutes * 60_000);
   createServer(handler(bridge, cfg)).listen(cfg.port, () =>
     console.log(
-      `alert bridge on :${cfg.port} → ~${cfg.channel}${dry ? " (dry run)" : ""} · pin ${cfg.pin ? "on" : "off"} · ack button ${cfg.actionUrl ? "on" : "off (BRIDGE_URL unset)"} · webhook auth ${cfg.token ? "on" : "OFF"}`
+      `alert bridge on :${cfg.port} → ~${cfg.channel}${dry ? " (dry run)" : ""} · pin ${cfg.pin ? "on" : "off"} · ack ${[cfg.ackReaction && `:${cfg.ackReaction}: reaction every ${cfg.ackPollSeconds}s`, cfg.actionUrl && "button"].filter(Boolean).join(" + ") || "off"} · webhook auth ${cfg.token ? "on" : "OFF"}`
     )
   );
 }
