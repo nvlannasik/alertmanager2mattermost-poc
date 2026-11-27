@@ -90,7 +90,7 @@ test("the table card: one status line, a meta line, a row per alert, Grafana and
     att.text,
     [
       "Pod is crash looping. The container restarted 5 times in 10 minutes.",
-      "`sample-apps` · dev · started 10:00 WIB",
+      "`sample-apps` · dev · `container=app` · started 10:00 WIB",
       "",
       "|  | Pod | Since | Resolved |",
       "|---|---|---|---|",
@@ -103,6 +103,15 @@ test("the table card: one status line, a meta line, a row per alert, Grafana and
       "_To acknowledge, click the :eyes: reaction under this post._",
     ].join("\n")
   );
+});
+
+test("a subject the whole group shares goes on the meta line; long label names get short headers", () => {
+  const disk = applyNotification(null, notification({ alertname: "NodeFilesystemSpaceFillingUp", node: "worker-2" }, [alert({ alertname: "NodeFilesystemSpaceFillingUp", severity: "warning", node: "worker-2", instance: "10.0.0.22:9100" }, { startsAt: iso(0) })]), at(0)).state;
+  const text = renderRoot(disk, { tz: "Asia/Jakarta", now: at(0) }).attachments[0].text;
+  assert.match(text, /^`node=worker-2` · started 10:00 WIB$/m, "the node the group is about is named");
+  assert.match(text, /\|  \| Instance \| Since \| Resolved \|/);
+  const pvc = applyNotification(null, notification({ alertname: "KubePersistentVolumeFillingUp" }, [alert({ alertname: "KubePersistentVolumeFillingUp", namespace: "monitoring", persistentvolumeclaim: "prometheus-server" }, { startsAt: iso(0) })]), at(0)).state;
+  assert.match(renderRoot(pvc, {}).attachments[0].text, /\|  \| PVC \| Since \| Resolved \|/);
 });
 
 test("a single alert with no label to tell it apart gets no table", () => {
@@ -173,7 +182,7 @@ test("firing → one post, pinned, 🔥; resolved → the SAME post edited green
   assert.match(post.message, /^✅ \*\*RESOLVED\*\* · \*\*KubePodCrashLooping\*\*/);
   assert.equal(post.props.attachments[0].color, "#188038");
   assert.equal(post.props.attachments[0].title, "✅ RESOLVED — KubePodCrashLooping");
-  assert.match(post.props.attachments[0].text, /^`sample-apps` · dev · started 10:00 WIB · resolved 10:37 · after 37m$/m);
+  assert.match(post.props.attachments[0].text, /^`sample-apps` · dev · `container=app` · started 10:00 WIB · resolved 10:37 · after 37m$/m);
   assert.equal(post.props.from_bot, "true", "server props survive the patch");
   assert.ok(!mm.pins.has(id));
   assert.ok(!mm.reacted(id, "fire") && mm.reacted(id, "white_check_mark"));

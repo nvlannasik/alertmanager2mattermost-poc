@@ -336,6 +336,9 @@ function shortcuts(state, cfg, isFiring, firing, alerts, common, one) {
 }
 
 const cell = (s) => String(s).replace(/\|/g, "\\|").replace(/\n+/g, " ");
+/** Column headers for labels whose own name reads badly as one. */
+const COLUMN = { persistentvolumeclaim: "PVC", statefulset: "StatefulSet", daemonset: "DaemonSet", replicaset: "ReplicaSet", cronjob: "CronJob", job_name: "Job", horizontalpodautoscaler: "HPA" };
+const columnTitle = (k) => COLUMN[k] ?? k.charAt(0).toUpperCase() + k.slice(1).replace(/_/g, " ");
 
 /**
  * The group's post. `cfg`: { tz, now, cardStyle ("table" | "detailed"), cardLinks, grafanaUrl,
@@ -384,22 +387,24 @@ export function renderRoot(state, cfg = {}) {
   if (style === "table") {
     const about = [summary, description && description !== summary ? description : undefined].filter(Boolean).join(" ");
     if (about) lines.push(about);
+    // A subject the whole group shares (its node, its scrape job) is not in the table, so it goes here.
+    const shared = PREFERRED_SUBJECT.filter((k) => !keys.includes(k)).map((k) => [k, groupLabel(state, k)]).filter(([, v]) => v).slice(0, 3);
     lines.push(
       [
         ns && `\`${ns}\``,
         cluster,
+        ...shared.map(([k, v]) => `\`${k}=${v}\``),
         `started ${clock(start, tz, now)} ${tzName}`,
         !isFiring && `resolved ${clock(state.resolvedAt, tz, now)} · after ${after(start, state.resolvedAt)}`,
         state.ack && `👀 @${state.ack.by} · ${clock(state.ack.at, tz, now)}`,
       ].filter(Boolean).join(" · ")
     );
     if (keys.length) {
-      const title = (k) => k.charAt(0).toUpperCase() + k.slice(1).replace(/_/g, " ");
       const rows = [
         ...firing.map((a) => ["🔥", ...keys.map((k) => (a.labels?.[k] ? `\`${cell(a.labels[k])}\`` : "—")), clock(a.startsAt, tz, now), "firing"]),
         ...resolved.map((a) => ["✅", ...keys.map((k) => (a.labels?.[k] ? `\`${cell(a.labels[k])}\`` : "—")), clock(a.startsAt, tz, now), `${clock(a.endsAt, tz, now)} · ${after(a.startsAt, a.endsAt)}`]),
       ];
-      const cols = ["", ...keys.map(title), "Since", "Resolved"];
+      const cols = ["", ...keys.map(columnTitle), "Since", "Resolved"];
       lines.push("", `| ${cols.join(" | ")} |`, `|${cols.map(() => "---").join("|")}|`, ...rows.slice(0, maxLines).map((r) => `| ${r.join(" | ")} |`));
       const more = rows.length - maxLines + (state.dropped ?? 0);
       if (more > 0) lines.push("", `_+${more} more_`);
